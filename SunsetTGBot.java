@@ -1,0 +1,817 @@
+package SunsetTGBot;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
+import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.TelegramBotsApi;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+import org.telegram.telegrambots.meta.api.objects.*;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
+import org.telegram.telegrambots.meta.api.methods.groupadministration.GetChat;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+
+import java.net.*;
+
+import java.nio.charset.StandardCharsets;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+
+import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
+import org.sqlite.SQLiteDataSource;
+
+import javax.sql.DataSource;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║                    SUNSET TG BOT CORE                        ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+public class SunsetTGBot extends TelegramLongPollingBot {
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                 CONFIG & FIELD INITIALIZATION                ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Загрузка конфигурации из JSON ═╗
+    static JSONObject config;
+    static {
+        try {
+            config = new JSONObject(new String(Files.readAllBytes(Paths.get("src\\SunsetTGBot\\config.json"))));
+        } catch (IOException e) { throw new RuntimeException(e); }
+    }
+    // ╚═════════════════════════════════╝
+
+    private static final String BOT_USERNAME = "Закатник";
+    private static final String BOT_TOKEN = config.getString("BOT_TOKEN");
+    static final String apiKeyOWM = config.getString("piKeyOWM");
+    final String apiKeyTZ = config.getString("apiKeyTZ");
+    private static DataSource dataSource = null;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    // ╔═ Конструктор и инициализация БД ═╗
+    public SunsetTGBot() {
+        SQLiteDataSource ds = new SQLiteDataSource();
+        ds.setUrl("jdbc:sqlite:userCities.db");
+        dataSource = ds;
+        initializeDatabase();
+    }
+    // ╚══════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                   UPDATE & COMMAND HANDLING                  ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Обработчик входящих сообщений ═╗
+    public void onUpdateReceived(Update update) {
+        Message message = update.getMessage();
+
+
+        if (message != null && message.hasText()) {
+            Long chatId = message.getChatId();
+            String text = message.getText();
+            String city = getUserCity(chatId);
+
+            SendMessage sendMessage = new SendMessage();
+            sendMessage.setChatId(chatId);
+            sendMessage.enableMarkdown(true);
+
+            if (text.equalsIgnoreCase("/start")) {
+                sendMsg(chatId, "Приветствую вас в '_Закатник_'! " +
+                        "Я здесь, чтобы помочь Вам насладиться закатами и предоставить актуальную погоду. " +
+                        "Для получения всей нужной информации: */help*", false, true);
+            } else if (text.equalsIgnoreCase("/changecity")) {
+                sendMsg(chatId, "Пожалуйста, введите название вашего города:", false, true);
+                saveUserAskingCity(chatId, true);
+            }else if (text.equalsIgnoreCase("/notifyOn")) {
+                saveUserNotify(chatId, true);
+                sendMsg(chatId, "Уведомления включены.", false, true);
+            } else if (text.equalsIgnoreCase("/notifyOff")) {
+                saveUserNotify(chatId, false);
+                sendMsg(chatId, "Уведомления отключены.", false, true);
+            } else if (text.startsWith("/broadcast") && text.length() > 10  && chatId == 1418333402) {
+                String broadcastMessage = text.substring(11);
+                broadcastMessage(broadcastMessage);
+                sendMsg(chatId, "Сообщение отправлено всем пользователям.", false, true);
+            } else if (text.equalsIgnoreCase("/clean") && chatId == 1418333402) {
+                clearUserCities();
+                sendMsg(chatId, "Очищенно.", false, true);
+            } else if (text.equalsIgnoreCase("/stats") && chatId == 1418333402) {
+                getStats(chatId);
+            } else if (Boolean.TRUE.equals(getUserAskingCity(chatId))) {
+                if (isValidCity(text)) {
+                    saveUserAskingCity(chatId, false);
+                    saveUserCity(chatId, text);
+                    sendMsg(chatId, "Отлично! Теперь мы будем оповещать Вас о великолепных закатах в '_" + getUserCity(chatId) + "_'", false, true);
+                } else if (text.charAt(0) == '/') {
+                    sendMsg(chatId, "Пожалуйста, вводите город или поселок, а не команду.", false, true);
+                } else {
+                    sendMsg(chatId, "Извините, но я не могу найти '_" + text + "_'. Пожалуйста, введите нужный город|поселок на русском языке.", false, true);
+                }
+
+            } else if (text.equalsIgnoreCase("/help"))  {
+                sendMsg(chatId, "Приветствуем в боте '_Закатник_', я буду вашим проводником в мир танцев света и облаков\n\n" +
+                        "Вот мои навыки:\n" +
+                        "- */changecity:* _Позволяет Вам выбрать город|поселок, чтобы я мог предоставлять информацию о закатах и погоде именно для Вашего местоположения._\n" +
+                        "- */sunset:* _Информирую Вас о сегодняшнем закате в выбранном месте жительсва, чтобы Вы могли насладиться этим волшебным моментом._\n" +
+                        "- */weather:* _Предоставляю текущий прогноз погоды, включая температуру, влажность, скорость ветра и другие параметры._\n" +
+                        "- */notifyOn:* _Включаю уведомления о закатах, так что вы никогда не пропустите эту красоту._\n" +
+                        "- */notifyOff:* _Отключаю уведомления, если вы предпочитаете проверять информацию самостоятельно._\n\n" +
+                        "Я создан, чтобы помочь Вам находить и наслаждаться закатами, где бы Вы ни находились.\n\n" +
+                        "Если у Вас возникнут вопросы или Вам потребуется помощь, свяжитесь с автором бота в Telegram.\n\n" +
+                        "_Пусть каждый Ваш вечер будет украшен великолепным закатом!❤_", true, true);
+            } else if (text.equalsIgnoreCase("/sunset")) {
+                if (city != null) getSunsetInfo(chatId, city);
+                else sendMsg(chatId, "Сначала введите город|поселок командой */changecity*", false, true);
+
+            } else if (text.equalsIgnoreCase("/weather")) {
+                if (city != null) getWeather(chatId, city);
+                else sendMsg(chatId, "Сначала введите город|поселок командой */changecity*", false, true);
+
+            } else {
+                sendMsg(chatId, "Для получения всех нужных команд пишите */help*", false, true);
+            }
+        }
+    }
+    // ╚════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║               SUNSET & WEATHER CALCULATION LOGIC             ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Генерация вердикта по качеству заката ═╗
+    public static String getSunsetVerdict(int sunsetChance, String cloudType) {
+        String verdict;
+        if (sunsetChance >= 80) verdict = "Приготовьтесь слепнуть от красоты!";
+        else if (sunsetChance >= 50) verdict = "Он может не быть самым лучшим в вашей жизни, но его стоит увидеть, все закаты чудесны!";
+        else verdict = "Не стоит надеяться на красоту сегодня, но позже погода обязательно наладится и принесет подарок!";
+
+        return "Сегодня ожидаются _" + cloudType + "_. Процент на красивый закат: *" + sunsetChance + "%*\n\n" + verdict +
+                "\n\n_Помните, что погода может преподнести сюрпризы!_";
+    }
+    // ╚═════════════════════════════════════════╝
+
+    // ╔═ Запрос и отправка полного прогноза погоды ═╗
+    private void getWeather(Long chatId, String city) {
+        try {
+            String weatherApiUrl = "https://api.openweathermap.org/data/2.5/weather?q=" + URLEncoder.encode(city, StandardCharsets.UTF_8) + "&appid=" + apiKeyOWM + "&units=metric";
+            String timezoneApiUrl = "http://api.timezonedb.com/v2.1/get-time-zone?key="+ apiKeyTZ +"&format=json&by=position&lat=LATITUDE&lng=LONGITUDE";
+            JSONObject weatherJson = makeApiRequest(weatherApiUrl);
+            if (weatherJson == null) {
+                sendMsg(chatId, "Ошибка получения данных о погоде.", false, true);
+                return;
+            }
+            JSONObject coordJson = weatherJson.getJSONObject("coord");
+            double lat = coordJson.getDouble("lat");
+            double lon = coordJson.getDouble("lon");
+
+            timezoneApiUrl = timezoneApiUrl.replace("LATITUDE", String.valueOf(lat)).replace("LONGITUDE", String.valueOf(lon));
+            JSONObject timezoneJson = makeApiRequest(timezoneApiUrl);
+            if (timezoneJson == null) {
+                sendMsg(chatId, "Ошибка получения данных о часовом поясе.", false, true);
+                return;
+            }
+            long sunsetUnix = weatherJson.getJSONObject("sys").getLong("sunset");
+            String timezoneId = timezoneJson.getString("zoneName");
+
+            LocalTime sunsetTime = Instant.ofEpochSecond(sunsetUnix)
+                    .atZone(ZoneId.of(timezoneId))
+                    .toLocalTime();
+            String forecastApiUrl = "https://api.openweathermap.org/data/2.5/forecast?q=" + URLEncoder.encode(city, StandardCharsets.UTF_8) + "&appid=" + apiKeyOWM + "&units=metric";
+            JSONObject forecastJson = makeApiRequest(forecastApiUrl);
+            if (forecastJson == null) {
+                sendMsg(chatId, "Ошибка получения прогноза погоды.", false, true);
+                return;
+            }
+            JSONArray forecastArray = forecastJson.getJSONArray("list");
+            JSONObject closestForecast = null;
+            long closestTimeDiff = Long.MAX_VALUE;
+            for (int i = 0; i < forecastArray.length(); i++) {
+                JSONObject forecast = forecastArray.getJSONObject(i);
+                long forecastTimeUnix = forecast.getLong("dt");
+                LocalTime forecastTime = Instant.ofEpochSecond(forecastTimeUnix)
+                        .atZone(ZoneId.of(timezoneId))
+                        .toLocalTime();
+                long timeDiff = Math.abs(Duration.between(sunsetTime, forecastTime).getSeconds());
+                if (timeDiff < closestTimeDiff) {
+                    closestTimeDiff = timeDiff;
+                    closestForecast = forecast;
+                }
+            }
+            if (closestForecast == null) {
+                sendMsg(chatId, "Не удалось найти прогноз на время заката.", false, true);
+                return;
+            }
+            JSONObject mainInfo = closestForecast.getJSONObject("main");
+            double temperature = mainInfo.getDouble("temp");
+            double pressure = mainInfo.getDouble("pressure");
+            double humidity = mainInfo.getDouble("humidity");
+            JSONObject windInfo = closestForecast.getJSONObject("wind");
+            double windSpeed = windInfo.getDouble("speed");
+            JSONObject cloudsInfo = closestForecast.getJSONObject("clouds");
+            int clouds = cloudsInfo.getInt("all");
+
+            JSONObject weather = closestForecast.getJSONArray("weather").getJSONObject(0);
+            String cloudDescription = weather.getString("description");
+
+            String cloudType = identifyCloudType(cloudDescription, temperature, humidity, windSpeed * 3.6);
+            int sunsetChance = calculateSunsetChance(windSpeed * 3.6, (int) humidity, clouds, cloudType);
+
+            sendMsg(chatId, "Прогноз погоды на время заката в " + city + ":\n" +
+                    "\n*Время заката:* " + sunsetTime.format(DateTimeFormatter.ofPattern("HH:mm")) +
+                    "\n\n_" + cloudType + "_" +
+                    "\n*Облачность: *" + clouds + "%" +
+                    "\n\n*Влажность:* " + humidity + "%" +
+                    "\n*Скорость ветра:* " + String.format(Locale.US, "%.2f", windSpeed * 3.6) + " км/ч" +
+                    "\n*Температура:* " + String.format(Locale.US, "%.1f", temperature) + "°C" +
+                    "\n*Давление:* " + String.format(Locale.US, "%.1f", pressure) + " гПа" +
+                    "\n\n*Шанс красивого заката:* " + sunsetChance + "%", false, true);
+        } catch (JSONException e) {
+            sendMsg(chatId, "Произошла ошибка: " + e.getMessage(), false, true);
+        }
+    }
+    // ╚══════════════════════════════════════════════╝
+
+    // ╔═ Запрос и отправка информации о закате ═╗
+    private void getSunsetInfo(Long chatId, String city) {
+        try {
+            String weatherApiUrl = "https://api.openweathermap.org/data/2.5/weather?q=" + URLEncoder.encode(city, StandardCharsets.UTF_8) + "&appid=" + apiKeyOWM + "&units=metric";
+            String timezoneApiUrl = "http://api.timezonedb.com/v2.1/get-time-zone?key="+ apiKeyTZ +"&format=json&by=position&lat=LATITUDE&lng=LONGITUDE";
+            JSONObject weatherJson = makeApiRequest(weatherApiUrl);
+            if (weatherJson == null) {
+                sendMsg(chatId, "Ошибка получения данных о погоде.", false, true);
+                return;
+            }
+
+            JSONObject coordJson = weatherJson.getJSONObject("coord");
+            double lat = coordJson.getDouble("lat");
+            double lon = coordJson.getDouble("lon");
+
+            timezoneApiUrl = timezoneApiUrl.replace("LATITUDE", String.valueOf(lat)).replace("LONGITUDE", String.valueOf(lon));
+            JSONObject timezoneJson = makeApiRequest(timezoneApiUrl);
+            if (timezoneJson == null) {
+                sendMsg(chatId, "Ошибка получения данных о часовом поясе.", false, true);
+                return;
+            }
+
+            long sunsetUnix = weatherJson.getJSONObject("sys").getLong("sunset");
+            String timezoneId = timezoneJson.getString("zoneName");
+
+            LocalTime sunsetTime = Instant.ofEpochSecond(sunsetUnix)
+                    .atZone(ZoneId.of(timezoneId))
+                    .toLocalTime();
+
+            String forecastApiUrl = "https://api.openweathermap.org/data/2.5/forecast?q=" + URLEncoder.encode(city, StandardCharsets.UTF_8) + "&appid=" + apiKeyOWM + "&units=metric";
+            JSONObject forecastJson = makeApiRequest(forecastApiUrl);
+            if (forecastJson == null) {
+                sendMsg(chatId, "Ошибка получения прогноза погоды.", false, true);
+                return;
+            }
+
+            JSONArray forecastArray = forecastJson.getJSONArray("list");
+            JSONObject closestForecast = null;
+            long closestTimeDiff = Long.MAX_VALUE;
+            for (int i = 0; i < forecastArray.length(); i++) {
+                JSONObject forecast = forecastArray.getJSONObject(i);
+                long forecastTimeUnix = forecast.getLong("dt");
+                LocalTime forecastTime = Instant.ofEpochSecond(forecastTimeUnix)
+                        .atZone(ZoneId.of(timezoneId))
+                        .toLocalTime();
+
+                long timeDiff = Math.abs(Duration.between(sunsetTime, forecastTime).getSeconds());
+                if (timeDiff < closestTimeDiff) {
+                    closestTimeDiff = timeDiff;
+                    closestForecast = forecast;
+                }
+            }
+            if (closestForecast == null) {
+                sendMsg(chatId, "Не удалось найти прогноз на время заката.", false, true);
+                return;
+            }
+            JSONObject mainInfo = closestForecast.getJSONObject("main");
+            double temperature = mainInfo.getDouble("temp");
+            double humidity = mainInfo.getDouble("humidity");
+            JSONObject windInfo = closestForecast.getJSONObject("wind");
+            double windSpeed = windInfo.getDouble("speed");
+            JSONObject cloudsInfo = closestForecast.getJSONObject("clouds");
+            int clouds = cloudsInfo.getInt("all");
+
+            JSONObject weather = closestForecast.getJSONArray("weather").getJSONObject(0);
+            String cloudDescription = weather.getString("description");
+
+            String cloudType = identifyCloudType(cloudDescription, temperature, humidity, windSpeed * 3.6);
+            int sunsetChance = calculateSunsetChance(windSpeed * 3.6, (int) humidity, clouds, cloudType);
+
+            sendMsg(chatId, getSunsetVerdict(sunsetChance, cloudType), false, true);
+        } catch (JSONException e) { sendMsg(chatId, "Произошла ошибка: " + e.getMessage(), false, true); }
+    }
+    // ╚═════════════════════════════════════════╝
+
+    // ╔═ Математический расчет процента красивого заката ═╗
+    public static int calculateSunsetChance(double windSpeed, int humidity, int cloudiness, String cloudType) {
+        int chance = 45;
+
+        if (windSpeed > 15)  chance -= 20;
+        else if (windSpeed > 10) chance -= 10;
+        else if (windSpeed < 5) chance += 5;
+
+        if (humidity > 85) chance -= 15;
+        else if (humidity > 70) chance -= 10;
+        else if (humidity < 40) chance += 5;
+
+        if (cloudType.contains("Слоисто-дождевые облака") || cloudType.contains("Кучево-дождевые облака")) chance -= 25;
+        else if (cloudType.contains("Слоистые облака") || cloudType.contains("Высокослоистые облака") || cloudType.contains("Отсутствие облаков")) chance -= 15;
+        else if (cloudType.contains("Высококучевые облака")) chance -= 10;
+        else if (cloudType.contains("Перистые облака") || cloudType.contains("Кучевые облака"))  chance += 20;
+
+
+        if (cloudiness >= 25 && cloudiness <= 50) chance += 10;
+        if (cloudiness >= 5 && cloudiness < 25) chance += 5;
+        if (cloudiness >= 5 && cloudiness < 25) chance += 10;
+        if (cloudiness > 75) chance -= 15;
+
+        if (chance > 89) chance = 89;
+        if (chance < 5) chance = 5;
+
+        return chance;
+    }
+    // ╚═════════════════════════════════════════════════╝
+
+    // ╔═ Определение типа облачности по метеоданным ═╗
+    public static String identifyCloudType(String description, double temperature, double humidity, double windSpeed) {
+        description = description.toLowerCase();
+
+        if (description.contains("clear") || description.contains("sky is clear")) return "Отсутствие облаков";
+
+        if (description.contains("light rain")) return "Слоисто-дождевые облака";
+
+        if (description.contains("thunderstorm")) return "Кучево-дождевые облака";
+
+        if (description.contains("heavy rain") || description.contains("shower rain")) return "Кучево-дождевые облака";
+
+        if (description.contains("rain")) return "Слоисто-дождевые облака";
+
+        if (description.contains("overcast") || description.contains("cloudy") ||
+                description.contains("partly cloudy") || description.contains("scattered clouds") ||
+                description.contains("broken clouds") || description.contains("few clouds")) {
+            if (temperature > 10 && humidity > 60 && windSpeed > 10) return "Перистые облака";
+            else return "Кучевые облака";
+
+        }
+        if (description.contains("altocumulus")) return "Высококучевые облака";
+
+        if (description.contains("altostratus")) return "Высокослоистые облака";
+
+        if (description.contains("stratus")) return "Слоистые облака";
+
+        if (description.contains("stratocumulus")) return "Слоисто-кучевые облака";
+
+        if (description.contains("cumulus")) return "Кучевые облака";
+
+        return "Тип облаков:" + description + " (если это вылезло, сообщите автору)";
+    }
+    // ╚══════════════════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                    NETWORK & API REQUESTS                    ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Выполнение HTTP GET запросов к внешним REST API ═╗
+    private JSONObject makeApiRequest(String apiUrl) {
+        HttpURLConnection connection = null;
+        try {
+            URL url = new URL(apiUrl);
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+
+            int responseCode = connection.getResponseCode();
+            if (responseCode == HttpURLConnection.HTTP_OK) {
+                BufferedReader in = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+                StringBuilder response = new StringBuilder();
+                String inputLine;
+                while ((inputLine = in.readLine()) != null) {
+                    response.append(inputLine);
+                }
+                in.close();
+                return new JSONObject(response.toString());
+            } else {
+                System.out.println("Ошибка: сервер вернул код " + responseCode);
+            }
+        } catch (IOException | JSONException e) { System.out.println("Произошла ошибка при выполнении запроса: " + e.getMessage());
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+        return null;
+    }
+    // ╚═══════════════════════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                SCHEDULED NOTIFICATION ENGINE                 ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Планировщик ежедневных автоматических рассылок ═╗
+    public void startWeatherNotifications() {
+        Runnable weatherNotifier = () -> {
+            List<String> cities = getAllCities();
+            for (String city : cities) {
+                Long chatId1 = getChatIdByCity(city);
+                Boolean notify = getUserNotify(chatId1);
+                if (Boolean.TRUE.equals(notify)) {
+                    Long chatId = getChatIdByCity(city);
+                    String weatherApiUrl = "https://api.openweathermap.org/data/2.5/weather?q=" + URLEncoder.encode(city, StandardCharsets.UTF_8) + "&appid=" + apiKeyOWM + "&units=metric";
+                    String timezoneApiUrl = "http://api.timezonedb.com/v2.1/get-time-zone?key=" + apiKeyTZ + "&format=json&by=position&lat=LATITUDE&lng=LONGITUDE";
+                    JSONObject weatherJson = makeApiRequest(weatherApiUrl);
+                    if (weatherJson == null) {
+                        sendMsg(chatId, "Ошибка получения данных о погоде.", false, true);
+                        return;
+                    }
+
+                    JSONObject coordJson = weatherJson.getJSONObject("coord");
+                    double lat = coordJson.getDouble("lat");
+                    double lon = coordJson.getDouble("lon");
+
+                    timezoneApiUrl = timezoneApiUrl.replace("LATITUDE", String.valueOf(lat)).replace("LONGITUDE", String.valueOf(lon));
+                    JSONObject timezoneJson = makeApiRequest(timezoneApiUrl);
+                    if (timezoneJson == null) {
+                        sendMsg(chatId, "Ошибка получения данных о часовом поясе.", false, true);
+                        return;
+                    }
+
+                    long sunsetUnix = weatherJson.getJSONObject("sys").getLong("sunset");
+                    String timezoneId = timezoneJson.getString("zoneName");
+
+                    LocalTime sunsetTime = Instant.ofEpochSecond(sunsetUnix)
+                            .atZone(ZoneId.of(timezoneId))
+                            .toLocalTime();
+
+                    String forecastApiUrl = "https://api.openweathermap.org/data/2.5/forecast?q=" + URLEncoder.encode(city, StandardCharsets.UTF_8) + "&appid=" + apiKeyOWM + "&units=metric";
+                    JSONObject forecastJson = makeApiRequest(forecastApiUrl);
+                    if (forecastJson == null) {
+                        sendMsg(chatId, "Ошибка получения прогноза погоды.", false, true);
+                        return;
+                    }
+
+                    JSONArray forecastArray = forecastJson.getJSONArray("list");
+                    JSONObject closestForecast = null;
+                    long closestTimeDiff = Long.MAX_VALUE;
+                    for (int i = 0; i < forecastArray.length(); i++) {
+                        JSONObject forecast = forecastArray.getJSONObject(i);
+                        long forecastTimeUnix = forecast.getLong("dt");
+                        LocalTime forecastTime = Instant.ofEpochSecond(forecastTimeUnix)
+                                .atZone(ZoneId.of(timezoneId))
+                                .toLocalTime();
+
+                        long timeDiff = Math.abs(Duration.between(sunsetTime, forecastTime).getSeconds());
+                        if (timeDiff < closestTimeDiff) {
+                            closestTimeDiff = timeDiff;
+                            closestForecast = forecast;
+                        }
+                    }
+                    if (closestForecast == null) {
+                        sendMsg(chatId, "Не удалось найти прогноз на время заката.", false, true);
+                        return;
+                    }
+                    JSONObject mainInfo = closestForecast.getJSONObject("main");
+                    double temperature = mainInfo.getDouble("temp");
+                    double humidity = mainInfo.getDouble("humidity");
+                    JSONObject windInfo = closestForecast.getJSONObject("wind");
+                    double windSpeed = windInfo.getDouble("speed");
+                    JSONObject cloudsInfo = closestForecast.getJSONObject("clouds");
+                    int clouds = cloudsInfo.getInt("all");
+
+                    JSONObject weather = closestForecast.getJSONArray("weather").getJSONObject(0);
+                    String cloudDescription = weather.getString("description");
+
+                    String cloudType = identifyCloudType(cloudDescription, temperature, humidity, windSpeed * 3.6);
+
+                    String verdict;
+                    int sunsetChance = calculateSunsetChance(windSpeed * 3.6, (int) humidity, clouds, cloudType);
+                    if (sunsetChance >= 80) verdict = "Приготовьтесь слепнуть от красоты!";
+                    else if (sunsetChance >= 50)
+                        verdict = "Он может не быть самым лучшим в вашей жизни, но его стоит увидеть, все закаты чудесны!";
+                    else
+                        verdict = "Не стоит надеяться на красоту сегодня, но позже погода обязательно наладится и принесет подарок!";
+
+                    if (chatId != null) {
+                        sendMsg(chatId, "*Оповещение перед закатом!* \n\nСегодня ожидаются _" + cloudType + "_. Процент на красивый закат: *" + sunsetChance + "%*\n\n" + verdict +
+                                "\n\n_Помните, что погода может преподнести сюрпризы!_", false, true);
+                    }
+                }
+            }
+        };
+        long delayUntil16 = computeDelayUntil(16, 0);
+        long delayUntil1930 = computeDelayUntil(19, 30);
+        scheduler.scheduleAtFixedRate(weatherNotifier, delayUntil16, TimeUnit.DAYS.toMillis(1), TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(weatherNotifier, delayUntil1930, TimeUnit.DAYS.toMillis(1), TimeUnit.MILLISECONDS);
+    }
+    // ╚══════════════════════════════════════════════════╝
+
+    // ╔═ Вычисление задержки до определенного часа и минут ═╗
+    private long computeDelayUntil(int hour, int minute) {
+        ZoneId zoneId = ZoneId.systemDefault();
+        ZonedDateTime now = ZonedDateTime.now(zoneId);
+        ZonedDateTime nextRun = now.withHour(hour).withMinute(minute).withSecond(0);
+        if (now.compareTo(nextRun) > 0) {
+            nextRun = nextRun.plusDays(1);
+        }
+        Duration duration = Duration.between(now, nextRun);
+        return duration.toMillis();
+    }
+    // ╚═════════════════════════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                  GEO SERVICES & VALIDATION                   ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Валидация введенного города через OpenStreetMap Nominatim ═╗
+    private boolean isValidCity(String cityName) {
+        try {
+            String apiUrl = "https://nominatim.openstreetmap.org/search?q=" + URLEncoder.encode(cityName, StandardCharsets.UTF_8) + "&format=json&limit=1&accept-language=ru";
+            URL url = new URL(apiUrl);
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("GET");
+
+            int responseCode = connection.getResponseCode();
+
+            if (responseCode == HttpURLConnection.HTTP_OK) {
+                BufferedReader in = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+                StringBuilder response = new StringBuilder();
+                String inputLine;
+                while ((inputLine = in.readLine()) != null) {
+                    response.append(inputLine);
+                }
+                in.close();
+
+                JSONArray jsonArray = new JSONArray(response.toString());
+                if (!jsonArray.isEmpty()) {
+                    JSONObject cityInfo = jsonArray.getJSONObject(0);
+                    String foundCityName = cityInfo.getString("display_name");
+                    return foundCityName.toLowerCase().contains(cityName.toLowerCase());
+                }
+            }
+        } catch (IOException | org.json.JSONException e) { e.printStackTrace(); } return false;
+    }
+    // ╚═════════════════════════════════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                ADMINISTRATION & TELEGRAM UTILS               ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Статистика пользователей для администратора ═╗
+    public void getStats(Long chatId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement("SELECT * FROM UserCities")) {
+            ResultSet rs = pstmt.executeQuery();
+            StringBuilder response = new StringBuilder("Зарегистрированные пользователи и их города:\n\n");
+            while (rs.next()) {
+                long userChatId = rs.getLong("chatId");
+                String city = rs.getString("city");
+                String username = getUsernameById(userChatId);
+                response.append("@").append(username).append(" ").append(city).append("\n");
+            }
+            sendMsg(chatId, response.toString(), false, false);
+        } catch (SQLException e) {
+            sendMsg(chatId, "Произошла ошибка при получении данных: " + e.getMessage(), false, true);
+        } catch (TelegramApiException e) {
+            sendMsg(chatId, "Произошла ошибка при обращении к Telegram API: " + e.getMessage(), false, true);
+        }
+    }
+    // ╚══════════════════════════════════════════════╝
+
+    // ╔═ Получение юзернейма по ID через API Telegram ═╗
+    public String getUsernameById(long userId) throws TelegramApiException {
+        GetChat getChatRequest = new GetChat();
+        getChatRequest.setChatId(userId);
+        Chat chat = execute(getChatRequest);
+        return chat.getUserName();
+    }
+    // ╚════════════════════════════════════════════════╝
+
+    // ╔═ Массовая рассылка сообщений пользователям ═╗
+    public void broadcastMessage(String message) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement("SELECT chatId FROM UserCities")) {
+            ResultSet rs = pstmt.executeQuery();
+            while (rs.next()) {
+                long chatId = rs.getLong("chatId");
+                sendMsg(chatId, message, false, false);
+            }
+        } catch (SQLException e) { System.out.println("Произошла ошибка при попытке рассылки сообщений: " + e.getMessage()); }
+    }
+    // ╚══════════════════════════════════════════════╝
+
+    // ╔═ Универсальная отправка сообщений с клавиатурой и разметкой ═╗
+    public void sendMsg(long chatId, String text, boolean addButton, boolean Markdown) {
+        SendMessage sendMessage = new SendMessage();
+        sendMessage.setChatId(chatId);
+        sendMessage.setText(text);
+        sendMessage.enableMarkdown(Markdown);
+
+        if (addButton) {
+            InlineKeyboardMarkup keyboardMarkup = new InlineKeyboardMarkup();
+            List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+            List<InlineKeyboardButton> row = new ArrayList<>();
+
+            InlineKeyboardButton button = new InlineKeyboardButton();
+            button.setText("Связаться с автором");
+            button.setUrl("https://t.me/jdjdjddjhddj");
+
+            row.add(button);
+            rows.add(row);
+
+            keyboardMarkup.setKeyboard(rows);
+            sendMessage.setReplyMarkup(keyboardMarkup);
+        }
+
+        try { execute(sendMessage);
+        } catch (TelegramApiException e) { e.printStackTrace(); }
+    }
+    // ╚═════════════════════════════════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                 DATABASE OPERATIONS (SQLITE)                 ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Получить список всех уникальных городов ═╗
+    private List<String> getAllCities() {
+        List<String> cities = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement("SELECT DISTINCT city FROM UserCities")) {
+            ResultSet rs = pstmt.executeQuery();
+            while (rs.next()) {
+                cities.add(rs.getString("city"));
+            }
+        } catch (SQLException e) { e.printStackTrace(); } return cities;
+    }
+    // ╚══════════════════════════════════════════╝
+
+    // ╔═ Получить chatId пользователя по названию города ═╗
+    private Long getChatIdByCity(String city) {
+        Long chatId = null;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement("SELECT chatId FROM UserCities WHERE city = ?")) {
+            pstmt.setString(1, city);
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                chatId = rs.getLong("chatId");
+            }
+        } catch (SQLException e) { e.printStackTrace(); } return chatId;
+    }
+    // ╚═══════════════════════════════════════════════════╝
+
+    // ╔═ Очистка таблицы городов ═╗
+    private void clearUserCities() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement("DELETE FROM UserCities")) {
+            pstmt.executeUpdate();
+        } catch (SQLException e) { e.printStackTrace(); }
+    }
+    // ╚═══════════════════════════╝
+
+    // ╔═ Сохранение или обновление города пользователя ═╗
+    private void saveUserCity(Long chatId, String city) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "INSERT INTO UserCities(chatId, city) VALUES(?, ?) ON CONFLICT(chatId) DO UPDATE SET city = ?")) {
+            pstmt.setLong(1, chatId);
+            pstmt.setString(2, city);
+            pstmt.setString(3, city);
+            pstmt.executeUpdate();
+        } catch (SQLException e) { e.printStackTrace(); }
+    }
+    // ╚═════════════════════════════════════════════════╝
+
+    // ╔═ Получение города пользователя ═╗
+    private static String getUserCity(Long chatId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "SELECT city FROM UserCities WHERE chatId = ?")) {
+            pstmt.setLong(1, chatId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("city");
+                }
+            }
+        } catch (SQLException e) { e.printStackTrace(); } return null;
+    }
+    // ╚═════════════════════════════════╝
+
+    // ╔═ Сохранение настроек уведомлений ═╗
+    private void saveUserNotify(Long chatId, Boolean notify) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "INSERT INTO UserSettings(chatId, notify) VALUES(?, ?) ON CONFLICT(chatId) DO UPDATE SET notify = ?")) {
+            pstmt.setLong(1, chatId);
+            pstmt.setBoolean(2, notify);
+            pstmt.setBoolean(3, notify);
+            pstmt.executeUpdate();
+        } catch (SQLException e) { e.printStackTrace(); }
+    }
+    // ╚══════════════════════════════════╝
+
+    // ╔═ Чтение настроек уведомлений ═╗
+    private static Boolean getUserNotify(Long chatId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "SELECT notify FROM UserSettings WHERE chatId = ?")) {
+            pstmt.setLong(1, chatId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getBoolean("notify");
+                }
+            }
+        } catch (SQLException e) { e.printStackTrace(); } return true;
+    }
+    // ╚═══════════════════════════════╝
+
+    // ╔═ Сохранение состояния ожидания ввода города ═╗
+    private void saveUserAskingCity(Long chatId, Boolean askingCity) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "INSERT INTO UserSettings(chatId, askingCity) VALUES(?, ?) ON CONFLICT(chatId) DO UPDATE SET askingCity = ?")) {
+            pstmt.setLong(1, chatId);
+            pstmt.setBoolean(2, askingCity);
+            pstmt.setBoolean(3, askingCity);
+            pstmt.executeUpdate();
+        } catch (SQLException e) { e.printStackTrace(); }
+    }
+    // ╚══════════════════════════════════════════════╝
+
+    // ╔═ Чтение состояния ожидания ввода города ═╗
+    private static Boolean getUserAskingCity(Long chatId) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "SELECT askingCity FROM UserSettings WHERE chatId = ?")) {
+            pstmt.setLong(1, chatId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getBoolean("askingCity");
+                }
+            }
+        } catch (SQLException e) { e.printStackTrace(); } return null;
+    }
+    // ╚══════════════════════════════════════════╝
+
+    // ╔═ Первичная инициализация схемы SQLite ═╗
+    private void initializeDatabase() {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(
+                     "CREATE TABLE IF NOT EXISTS UserSettings (" +
+                             "chatId INTEGER PRIMARY KEY," +
+                             "notify BOOLEAN," +
+                             "askingCity BOOLEAN)")){
+            pstmt.executeUpdate();
+        } catch (SQLException e) { e.printStackTrace(); }
+    }
+    // ╚════════════════════════════════════════╝
+
+
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║                       APPLICATION ENTRY                      ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ╔═ Главная точка входа приложения ═╗
+    public static void main(String[] args) throws TelegramApiException, IOException {
+        TelegramBotsApi telegramBotsApi = new TelegramBotsApi(DefaultBotSession.class);
+        SunsetTGBot bot = new SunsetTGBot();
+        bot.startWeatherNotifications();
+        try {
+            telegramBotsApi.registerBot(bot);
+            System.out.println("Бот запущен.");
+        } catch (TelegramApiException e) { e.printStackTrace(); }
+    }
+    // ╚═════════════════════════════════╝
+
+    // ╔═ Геттеры авторизационных данных ботов Telegram API ═╗
+    public String getBotUsername() { return BOT_USERNAME; }
+
+    public String getBotToken() { return BOT_TOKEN; }
+    // ╚═════════════════════════════════════════════════════╝
+}
